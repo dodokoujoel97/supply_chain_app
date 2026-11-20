@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
+import comparison
 import data_quality as dq
 import metrics
 
@@ -299,8 +300,9 @@ def load_data(uploaded_file, require_date, dayfirst_flag, issues=None):
         quantities = pd.to_numeric(df["Quantité"], errors="coerce")
         n_bad_qty = int(quantities.isna().sum())
         if n_bad_qty:
-            issues.append(dq.issue(dq.WARNING, f"{label} : {n_bad_qty} quantité(s) vide(s) ou non numérique(s), comptée(s) comme 0."))
-        df["Quantité"] = quantities.fillna(0)
+            issues.append(dq.issue(dq.WARNING, f"{label} : {n_bad_qty} ligne(s) ignorée(s) car la quantité est vide ou non numérique."))
+        df["Quantité"] = quantities
+        df = df.dropna(subset=["Quantité"])
         issues.extend(dq.check_frame(df, label, "Quantité"))
     else:
         df = infer_missing_columns(df, ["Item", "Stock"])
@@ -311,8 +313,9 @@ def load_data(uploaded_file, require_date, dayfirst_flag, issues=None):
         stocks = pd.to_numeric(df["Stock"], errors="coerce")
         n_bad_stock = int(stocks.isna().sum())
         if n_bad_stock:
-            issues.append(dq.issue(dq.WARNING, f"{label} : {n_bad_stock} stock(s) vide(s) ou non numérique(s), compté(s) comme 0."))
-        df["Stock"] = stocks.fillna(0)
+            issues.append(dq.issue(dq.WARNING, f"{label} : {n_bad_stock} ligne(s) ignorée(s) car le stock est vide ou non numérique."))
+        df["Stock"] = stocks
+        df = df.dropna(subset=["Stock"])
         issues.extend(dq.check_frame(df, label, "Stock"))
 
     return df
@@ -417,18 +420,20 @@ quality_issues.extend(dq.check_consistency(orders_df, forecast_df, stock_df, pri
 # ---------------------------------------------------------------------------
 # Calculs communs (faits une seule fois, utilisés par les onglets Analyse et Graphiques)
 # ---------------------------------------------------------------------------
-orders_summary = (
-    orders_df.groupby([pd.Grouper(key="Date", freq=freq), "Item"])["Quantité"]
-    .sum().reset_index().rename(columns={"Quantité": "Réel"})
-)
-forecast_summary = (
-    forecast_df.groupby([pd.Grouper(key="Date", freq=freq), "Item"])["Quantité"]
-    .sum().reset_index().rename(columns={"Quantité": "Prévision"})
-)
-merged = pd.merge(orders_summary, forecast_summary, on=["Date", "Item"], how="outer").fillna(0)
-merged = merged.sort_values(["Item", "Date"]).reset_index(drop=True)
-merged["Écart"] = merged["Prévision"] - merged["Réel"]
-merged["Écart %"] = np.where(merged["Réel"] != 0, merged["Écart"] / merged["Réel"] * 100, np.nan)
+merged = comparison.merge_orders_forecast(orders_df, forecast_df, freq)
+n_real_missing, n_forecast_missing = comparison.data_gap_counts(merged)
+if n_forecast_missing:
+    quality_issues.append(dq.issue(
+        dq.WARNING,
+        f"{n_forecast_missing} combinaison(s) période/article ont des commandes mais aucune ligne de prévision "
+        "(marquées « Prévision absente »). Leur écart est laissé vide et elles sont exclues du WAPE et du biais.",
+    ))
+if n_real_missing:
+    quality_issues.append(dq.issue(
+        dq.INFO,
+        f"{n_real_missing} combinaison(s) période/article ont une prévision mais aucune commande "
+        "(marquées « Réel absent ») : comptées comme une demande nulle.",
+    ))
 
 # --- Couverture stock PROJETÉE dans le temps (corrige le bug du stock statique) ---
 if stock_df is not None:
@@ -455,7 +460,10 @@ if price_df is not None:
 if has_prix_vente:
     merged["CA réel"] = merged["Réel"] * merged["Prix vente"]
     merged["CA prévision"] = merged["Prévision"] * merged["Prix vente"]
-    merged["Écart CA"] = merged["CA prévision"] - merged["CA réel"]
+    # Sans ligne de prévision, l'écart de CA n'a pas de sens : on le laisse vide (comme l'écart en unités).
+    merged["Écart CA"] = (merged["CA prévision"] - merged["CA réel"]).where(
+        merged["Données"] != comparison.FORECAST_MISSING
+    )
 
 if has_prix_achat:
     # Valorisation du stock projeté : une rupture (stock projeté négatif) n'est pas un actif négatif,
@@ -489,17 +497,9 @@ if has_prix_vente:
     })
     item_totals = pd.merge(item_totals, ca_totals, on="Item", how="left")
 
-# WAPE (erreur absolue pondérée par les volumes) et biais en volume, par article.
-item_totals["WAPE (%)"] = np.where(
-    item_totals["Réel total"] > 0,
-    (item_totals["Écart absolu total"] / item_totals["Réel total"] * 100).round(1),
-    np.nan,
-)
-item_totals["Biais (%)"] = np.where(
-    item_totals["Réel total"] > 0,
-    ((item_totals["Prévision total"] - item_totals["Réel total"]) / item_totals["Réel total"] * 100).round(1),
-    np.nan,
-)
+# WAPE (erreur absolue pondérée par les volumes) et biais en volume, par article
+# (calculés hors lignes « Prévision absente »).
+item_totals = pd.merge(item_totals, comparison.accuracy_by_item(merged), on="Item", how="left")
 
 q75 = item_totals["Écart absolu total"].quantile(0.75)
 q50 = item_totals["Écart absolu total"].quantile(0.50)
@@ -598,7 +598,7 @@ with analysis_tab:
         st.metric("Stock total initial", int(stock_summary["Stock"].sum()))
 
     st.header("Analyse des écarts par période et par pièce")
-    display_cols = ["Date", "Item", "Réel", "Prévision", "Écart", "Écart %", "Besoin net", "Statut couverture", "Lancer OF"]
+    display_cols = ["Date", "Item", "Réel", "Prévision", "Écart", "Écart %", "Besoin net", "Statut couverture", "Lancer OF", "Données"]
     fmt = {"Écart": "{:.0f}", "Écart %": "{:.1f}%", "Stock projeté": "{:.0f}", "Besoin net": "{:.0f}"}
     if stock_df is not None:
         display_cols.insert(6, "Stock projeté")
@@ -621,8 +621,9 @@ with analysis_tab:
     col3.metric("Total réel", int(merged["Réel"].sum()))
     col4.metric("Total prévision", int(merged["Prévision"].sum()))
     col5.metric("Total écart", int(merged["Écart"].sum()))
-    global_wape = metrics.wape(merged["Réel"], merged["Prévision"])
-    global_bias = metrics.bias_volume(merged["Réel"], merged["Prévision"])
+    measurable = comparison.accuracy_rows(merged)
+    global_wape = metrics.wape(measurable["Réel"], measurable["Prévision"])
+    global_bias = metrics.bias_volume(measurable["Réel"], measurable["Prévision"])
     col6, col7 = st.columns(2)
     col6.metric(
         "WAPE (erreur absolue pondérée)",
@@ -637,6 +638,11 @@ with analysis_tab:
              "négatif : il la sous-estime.",
     )
     st.caption(f"Lecture du biais : {metrics.describe_bias(global_bias)}.")
+    if n_forecast_missing:
+        st.caption(
+            f"{n_forecast_missing} ligne(s) « Prévision absente » exclue(s) du WAPE, du biais et du total d'écart "
+            "(le total d'écart n'est donc pas égal à total prévu − total réel)."
+        )
 
     if has_prix_vente or has_prix_achat:
         st.markdown("---")
