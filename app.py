@@ -7,6 +7,7 @@ import pandas as pd
 import streamlit as st
 
 import data_quality as dq
+import metrics
 
 # ---------------------------------------------------------------------------
 # Garde-fou "bare mode" : si le script est lancé avec `python app.py` au lieu de
@@ -488,9 +489,15 @@ if has_prix_vente:
     })
     item_totals = pd.merge(item_totals, ca_totals, on="Item", how="left")
 
-item_totals["Indice de risque (%)"] = np.where(
-    item_totals["Prévision total"] > 0,
-    (item_totals["Écart absolu total"] / item_totals["Prévision total"] * 100).round(1),
+# WAPE (erreur absolue pondérée par les volumes) et biais en volume, par article.
+item_totals["WAPE (%)"] = np.where(
+    item_totals["Réel total"] > 0,
+    (item_totals["Écart absolu total"] / item_totals["Réel total"] * 100).round(1),
+    np.nan,
+)
+item_totals["Biais (%)"] = np.where(
+    item_totals["Réel total"] > 0,
+    ((item_totals["Prévision total"] - item_totals["Réel total"]) / item_totals["Réel total"] * 100).round(1),
     np.nan,
 )
 
@@ -547,17 +554,15 @@ def explain_gap(row):
 item_totals["Justification"] = item_totals.apply(explain_gap, axis=1)
 item_totals = item_totals.sort_values("Écart absolu total", ascending=False).reset_index(drop=True)
 
-# --- Besoin recommandé, corrigé du biais moyen du système (plutôt qu'une marge arbitraire) ---
-item_bias = (
-    merged[merged["Réel"] != 0].groupby("Item")["Écart %"].mean().reset_index().rename(columns={"Écart %": "Biais moyen %"})
-)
+# --- Besoin recommandé, corrigé du biais en volume du système (plutôt qu'une marge arbitraire) ---
 n_periods = merged.groupby("Item")["Date"].nunique().reset_index().rename(columns={"Date": "Nb périodes"})
-item_reco = pd.merge(item_totals[["Item", "Prévision total"]], n_periods, on="Item", how="left")
-item_reco = pd.merge(item_reco, item_bias, on="Item", how="left").fillna({"Biais moyen %": 0})
+item_reco = pd.merge(item_totals[["Item", "Prévision total", "Biais (%)"]], n_periods, on="Item", how="left")
+item_reco = item_reco.rename(columns={"Biais (%)": "Biais en volume %"})
+item_reco["Biais en volume %"] = item_reco["Biais en volume %"].fillna(0)
 item_reco["Prévision moyenne / période"] = (item_reco["Prévision total"] / item_reco["Nb périodes"].replace(0, np.nan)).fillna(0)
 item_reco["Besoin recommandé / période"] = np.where(
-    (1 + item_reco["Biais moyen %"] / 100) > 0,
-    item_reco["Prévision moyenne / période"] / (1 + item_reco["Biais moyen %"] / 100),
+    (1 + item_reco["Biais en volume %"] / 100) > 0,
+    item_reco["Prévision moyenne / période"] / (1 + item_reco["Biais en volume %"] / 100),
     item_reco["Prévision moyenne / période"],
 ).round(0)
 
@@ -616,8 +621,22 @@ with analysis_tab:
     col3.metric("Total réel", int(merged["Réel"].sum()))
     col4.metric("Total prévision", int(merged["Prévision"].sum()))
     col5.metric("Total écart", int(merged["Écart"].sum()))
-    avg_error = merged["Écart %"].abs().mean()
-    st.write(f"Erreur moyenne absolue sur les périodes/articles : **{avg_error:.1f}%**" if pd.notna(avg_error) else "Erreur moyenne absolue : non calculable.")
+    global_wape = metrics.wape(merged["Réel"], merged["Prévision"])
+    global_bias = metrics.bias_volume(merged["Réel"], merged["Prévision"])
+    col6, col7 = st.columns(2)
+    col6.metric(
+        "WAPE (erreur absolue pondérée)",
+        "—" if pd.isna(global_wape) else f"{global_wape:.1f} %",
+        help="Somme des écarts absolus ÷ somme du réel. Plus c'est bas, meilleur est le prévisionnel. "
+             "Les petites quantités ne faussent pas cet indicateur.",
+    )
+    col7.metric(
+        "Biais en volume",
+        "—" if pd.isna(global_bias) else f"{global_bias:+.1f} %",
+        help="(Total prévu − total réel) ÷ total réel. Positif : le système surestime la demande ; "
+             "négatif : il la sous-estime.",
+    )
+    st.caption(f"Lecture du biais : {metrics.describe_bias(global_bias)}.")
 
     if has_prix_vente or has_prix_achat:
         st.markdown("---")
@@ -643,12 +662,13 @@ with analysis_tab:
     st.markdown("---")
     st.header("Recommandations de besoin")
     st.caption(
-        "Corrige le biais moyen observé entre le système et le réel, plutôt qu'une marge forfaitaire arbitraire."
+        "Corrige la prévision moyenne du biais en volume observé entre le système et le réel, "
+        "plutôt que d'appliquer une marge forfaitaire arbitraire."
     )
     st.dataframe(
-        item_reco[["Item", "Prévision moyenne / période", "Biais moyen %", "Besoin recommandé / période"]]
+        item_reco[["Item", "Prévision moyenne / période", "Biais en volume %", "Besoin recommandé / période"]]
         .rename(columns={"Item": "Pièce"})
-        .style.format({"Biais moyen %": "{:.1f}%", "Prévision moyenne / période": "{:.0f}", "Besoin recommandé / période": "{:.0f}"}),
+        .style.format({"Biais en volume %": "{:+.1f}%", "Prévision moyenne / période": "{:.0f}", "Besoin recommandé / période": "{:.0f}"}),
         use_container_width=True,
     )
 
@@ -663,10 +683,13 @@ with analysis_tab:
     })
     priority_cols = [
         "Pièce / référence", "Réel total", "Prévision total", "Écart absolu total",
-        "Stock projeté (fin de période)", "Indice de risque (%)", "Priorité",
+        "Stock projeté (fin de période)", "WAPE (%)", "Biais (%)", "Priorité",
         "Action recommandée", "Justification",
     ]
-    priority_fmt = {"Écart absolu total": "{:.0f}", "Stock projeté (fin de période)": "{:.0f}", "Indice de risque (%)": "{:.1f}%"}
+    priority_fmt = {
+        "Écart absolu total": "{:.0f}", "Stock projeté (fin de période)": "{:.0f}",
+        "WAPE (%)": "{:.1f}%", "Biais (%)": "{:+.1f}%",
+    }
     if has_prix_vente:
         priority_cols[3:3] = ["CA réel total", "Écart CA absolu total"]
         priority_fmt.update({"CA réel total": "{:.0f}", "Écart CA absolu total": "{:.0f}"})
@@ -738,7 +761,7 @@ with charts_tab:
                     domain=["Urgent", "Élevée", "Moyenne", "Faible"],
                     range=["#d62728", "#ff7f0e", "#f1c40f", "#2ca02c"],
                 )),
-                tooltip=["Item", pareto_metric, "Indice de risque (%)", "Priorité", "Action recommandée"],
+                tooltip=["Item", pareto_metric, "WAPE (%)", "Biais (%)", "Priorité", "Action recommandée"],
             ).properties(title="Diagramme Pareto par référence", height=360)
             line = alt.Chart(top10).mark_line(color="#7dd3fc", point=True, strokeWidth=2.5).encode(
                 x=alt.X("Item:N", sort="-y"),
