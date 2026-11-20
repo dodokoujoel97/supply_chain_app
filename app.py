@@ -1,3 +1,4 @@
+import datetime
 import re
 import sys
 import unicodedata
@@ -78,6 +79,12 @@ dayfirst = st.sidebar.checkbox(
 freq_choice = st.sidebar.selectbox("Période d'agrégation", options=["Semaine", "Mois"], index=0)
 freq = {"Semaine": "W-MON", "Mois": "MS"}[freq_choice]
 currency = st.sidebar.text_input("Devise", value="DH", max_chars=6)
+reference_date = st.sidebar.date_input(
+    "Date de référence (aujourd'hui)",
+    value=datetime.date.today(),
+    help="Sert à savoir si la date limite de commande est déjà dépassée. "
+         "Utilisée seulement si un fichier de délais d'approvisionnement est fourni.",
+)
 
 with st.sidebar.expander("📥 Fichiers d'exemple"):
     sample_orders = pd.DataFrame({
@@ -96,6 +103,14 @@ with st.sidebar.expander("📥 Fichiers d'exemple"):
         "Prix vente": [150, 220],
         "Prix achat": [90, 130],
     })
+    sample_receipts = pd.DataFrame({
+        "Date": ["08/06/2026", "15/06/2026"], "Item": ["SKU001", "SKU002"], "Quantité": [150, 40],
+    })
+    sample_params = pd.DataFrame({
+        "Item": ["SKU001", "SKU002"], "Délai (jours)": [7, 14], "Stock sécurité": [30, 10],
+    })
+    st.download_button("Exemple réceptions", sample_receipts.to_csv(index=False).encode("utf-8"), "exemple_receptions.csv", "text/csv")
+    st.download_button("Exemple délais / stock sécurité", sample_params.to_csv(index=False).encode("utf-8"), "exemple_parametres.csv", "text/csv")
     st.download_button("Exemple commandes", sample_orders.to_csv(index=False).encode("utf-8"), "exemple_commandes.csv", "text/csv")
     st.download_button("Exemple prévisionnel", sample_forecast.to_csv(index=False).encode("utf-8"), "exemple_previsionnel.csv", "text/csv")
     st.download_button("Exemple stock", sample_stock.to_csv(index=False).encode("utf-8"), "exemple_stock.csv", "text/csv")
@@ -144,7 +159,11 @@ with home_tab:
     with st.expander("Comment la couverture de stock est-elle calculée ?"):
         st.write(
             "Le stock initial est décrémenté période après période par le besoin réel déjà consommé. "
-            "Ce n'est donc pas le même stock qui est compté plusieurs fois pour plusieurs périodes."
+            "Ce n'est donc pas le même stock qui est compté plusieurs fois pour plusieurs périodes. "
+            "Si tu fournis les réceptions attendues, elles sont ajoutées au stock dès leur période. "
+            "Un stock de sécurité fait passer l'article « Sous stock de sécurité » avant la rupture, "
+            "et un délai d'approvisionnement donne la date limite de commande "
+            "(première date à risque − délai)."
         )
     with st.expander("Comment obtenir le chiffre d'affaires et la valeur de stock ?"):
         st.write(
@@ -172,6 +191,16 @@ with unique_tab:
         "Prix par article (CSV / Excel) — optionnel", type=["csv", "xlsx", "xls"], key="price_single",
         help="Colonnes Item + Prix vente et/ou Prix achat/coût. Active le calcul du chiffre d'affaires et de la valeur de stock immobilisé.",
     )
+    receipts_file = st.file_uploader(
+        "Réceptions attendues (CSV / Excel) — optionnel", type=["csv", "xlsx", "xls"], key="receipts_single",
+        help="Colonnes Date, Item, Quantité : commandes fournisseurs ou ordres de fabrication déjà lancés. "
+             "Elles sont ajoutées au stock projeté (nécessite le fichier de stock).",
+    )
+    params_file = st.file_uploader(
+        "Délais et stock de sécurité (CSV / Excel) — optionnel", type=["csv", "xlsx", "xls"], key="params_single",
+        help="Colonnes Item + Délai (jours) et/ou Stock sécurité. Le délai donne la date limite de commande ; "
+             "le stock de sécurité déclenche une alerte avant la rupture (nécessite le fichier de stock).",
+    )
 
 with multi_tab:
     st.subheader("Téléchargement multiple")
@@ -179,6 +208,8 @@ with multi_tab:
     multi_forecast_files = st.file_uploader("Plusieurs fichiers prévision", type=["csv", "xlsx", "xls"], accept_multiple_files=True, key="forecast_multi")
     multi_stock_files = st.file_uploader("Plusieurs fichiers stock", type=["csv", "xlsx", "xls"], accept_multiple_files=True, key="stock_multi")
     multi_price_files = st.file_uploader("Plusieurs fichiers prix — optionnel", type=["csv", "xlsx", "xls"], accept_multiple_files=True, key="price_multi")
+    multi_receipts_files = st.file_uploader("Plusieurs fichiers réceptions — optionnel", type=["csv", "xlsx", "xls"], accept_multiple_files=True, key="receipts_multi")
+    multi_params_files = st.file_uploader("Plusieurs fichiers délais / stock de sécurité — optionnel", type=["csv", "xlsx", "xls"], accept_multiple_files=True, key="params_multi")
     st.caption("La comparaison multi-fichiers concatène les données chargées pour analyser plusieurs lots, périodes ou scénarios.")
 
 # ---------------------------------------------------------------------------
@@ -201,6 +232,11 @@ COLUMN_MAPPING = {
     "prixachat": "Prix achat", "prixdachat": "Prix achat", "cout": "Prix achat", "coutunitaire": "Prix achat",
     "coutachat": "Prix achat", "prixderevient": "Prix achat", "prixderevientunitaire": "Prix achat",
     "cost": "Prix achat", "puachat": "Prix achat", "coutstandard": "Prix achat",
+    "delai": "Délai (jours)", "delaijours": "Délai (jours)", "delaijour": "Délai (jours)",
+    "delaiapprovisionnement": "Délai (jours)", "delaidapprovisionnement": "Délai (jours)",
+    "delaidelivraison": "Délai (jours)", "leadtime": "Délai (jours)", "lt": "Délai (jours)",
+    "stocksecurite": "Stock sécurité", "stockdesecurite": "Stock sécurité", "stocksecu": "Stock sécurité",
+    "ss": "Stock sécurité", "safetystock": "Stock sécurité",
 }
 
 
@@ -344,6 +380,62 @@ def load_price_data(uploaded_file):
     return df
 
 
+def load_params_data(uploaded_file, issues=None):
+    """Charge un fichier de paramètres par article : Item + Délai (jours) et/ou Stock sécurité.
+    Les valeurs non numériques ou négatives sont ignorées (avec une alerte)."""
+    issues = issues if issues is not None else []
+    label = f"'{uploaded_file.name}'"
+    df = read_tabular_file(uploaded_file)
+    df.columns = [str(c).strip() for c in df.columns]
+    df = normalize_columns(df)
+    df = infer_missing_columns(df, ["Item"])
+    df = df.loc[:, ~df.columns.duplicated()].copy()
+
+    if "Item" not in df.columns:
+        raise ValueError(f"{label} : colonne Item manquante.")
+    value_cols = [c for c in ("Délai (jours)", "Stock sécurité") if c in df.columns]
+    if not value_cols:
+        raise ValueError(f"{label} : aucune colonne reconnue (Délai (jours) et/ou Stock sécurité).")
+
+    df["Item"] = df["Item"].astype(str).str.strip()
+    for col in value_cols:
+        values = pd.to_numeric(df[col], errors="coerce")
+        n_invalid = int((values.isna() & df[col].notna()).sum())
+        n_negative = int((values < 0).sum())
+        if n_invalid or n_negative:
+            issues.append(dq.issue(
+                dq.WARNING,
+                f"{label} : {n_invalid + n_negative} valeur(s) non numérique(s) ou négative(s) dans « {col} », ignorée(s).",
+            ))
+        df[col] = values.where(values >= 0)
+    return df[["Item"] + value_cols]
+
+
+def safe_load_params(files, issues=None):
+    issues = issues if issues is not None else []
+    frames, errors = [], []
+    for f in files:
+        if f is None:
+            continue
+        try:
+            frames.append(load_params_data(f, issues))
+        except ValueError as e:
+            errors.append(str(e))
+    for e in errors:
+        st.error(e)
+    if not frames:
+        return None
+    combined = pd.concat(frames, ignore_index=True) if len(frames) > 1 else frames[0]
+    repeated = combined.loc[combined.duplicated("Item", keep="last"), "Item"].unique()
+    if len(repeated):
+        issues.append(dq.issue(
+            dq.WARNING,
+            f"Paramètres : {len(repeated)} article(s) présents plusieurs fois ({', '.join(map(str, repeated[:5]))}). "
+            "La dernière ligne est conservée.",
+        ))
+    return combined.drop_duplicates("Item", keep="last").reset_index(drop=True)
+
+
 def safe_load_many(files, require_date, dayfirst_flag, issues=None, role="Fichiers"):
     """Charge une liste de fichiers en ignorant ceux en erreur (avec message), plutôt que
     de faire planter toute l'application à cause d'un seul fichier mal formé.
@@ -406,13 +498,18 @@ if single_ready:
     forecast_df = safe_load_many([forecast_file], True, dayfirst, quality_issues, "Prévisionnel")
     stock_df = safe_load_many([stock_file] if stock_file is not None else [], False, dayfirst, quality_issues, "Stock")
     price_df = safe_load_prices([price_file] if price_file is not None else [], quality_issues)
+    receipts_df = safe_load_many([receipts_file] if receipts_file is not None else [], True, dayfirst, quality_issues, "Réceptions")
+    params_df = safe_load_params([params_file] if params_file is not None else [], quality_issues)
 elif multi_ready:
     orders_df = safe_load_many(multi_orders_files, True, dayfirst, quality_issues, "Commandes")
     forecast_df = safe_load_many(multi_forecast_files, True, dayfirst, quality_issues, "Prévisionnel")
     stock_df = safe_load_many(multi_stock_files, False, dayfirst, quality_issues, "Stock")
     price_df = safe_load_prices(multi_price_files, quality_issues)
+    receipts_df = safe_load_many(multi_receipts_files, True, dayfirst, quality_issues, "Réceptions")
+    params_df = safe_load_params(multi_params_files, quality_issues)
 else:
     orders_df, forecast_df, stock_df, price_df = None, None, None, None
+    receipts_df, params_df = None, None
 
 if orders_df is None or forecast_df is None:
     with analysis_tab:
@@ -424,7 +521,13 @@ if orders_df is None or forecast_df is None:
     # mais on protège explicitement la suite au cas où (ex. environnement non standard).
     raise SystemExit
 
-quality_issues.extend(dq.check_consistency(orders_df, forecast_df, stock_df, price_df))
+quality_issues.extend(dq.check_consistency(orders_df, forecast_df, stock_df, price_df, receipts_df, params_df))
+if stock_df is None and (receipts_df is not None or params_df is not None):
+    quality_issues.append(dq.issue(
+        dq.WARNING,
+        "Les réceptions, délais et stocks de sécurité ne sont utilisés que si un fichier de stock est fourni : "
+        "ils sont ignorés pour l'instant.",
+    ))
 
 # ---------------------------------------------------------------------------
 # Calculs communs (faits une seule fois, utilisés par les onglets Analyse et Graphiques)
@@ -445,11 +548,15 @@ if n_real_missing:
     ))
 
 # --- Couverture de stock projetée, valorisation, priorités et besoin recommandé (voir planning.py) ---
-merged = planning.project_stock(merged, stock_df)
+merged = planning.project_stock(merged, stock_df, receipts_df, params_df, freq)
 has_prix_vente = price_df is not None and "Prix vente" in price_df.columns
 has_prix_achat = price_df is not None and "Prix achat" in price_df.columns
 merged = planning.add_valuation(merged, price_df)
-item_totals = planning.summarize_items(merged, stock_df is not None, has_prix_vente, has_prix_achat)
+item_totals = planning.summarize_items(
+    merged, stock_df is not None, has_prix_vente, has_prix_achat, params_df, pd.Timestamp(reference_date)
+)
+# Colonnes supplémentaires affichées seulement si réceptions ou paramètres sont fournis.
+has_advanced_stock = stock_df is not None and (receipts_df is not None or params_df is not None)
 item_reco = planning.recommend_need(merged, item_totals)
 
 # ---------------------------------------------------------------------------
@@ -488,6 +595,9 @@ with analysis_tab:
     fmt = {"Écart": "{:.0f}", "Écart %": "{:.1f}%", "Stock projeté": "{:.0f}", "Besoin net": "{:.0f}"}
     if stock_df is not None:
         display_cols.insert(6, "Stock projeté")
+    if "Réceptions cumulées" in merged.columns:
+        display_cols.insert(6, "Réceptions cumulées")
+        fmt["Réceptions cumulées"] = "{:.0f}"
     if has_prix_vente:
         display_cols += ["CA réel", "CA prévision", "Écart CA"]
         fmt.update({"CA réel": "{:.0f}", "CA prévision": "{:.0f}", "Écart CA": "{:.0f}"})
@@ -582,6 +692,18 @@ with analysis_tab:
         "Écart absolu total": "{:.0f}", "Stock projeté (fin de période)": "{:.0f}",
         "WAPE (%)": "{:.1f}%", "Biais (%)": "{:+.1f}%",
     }
+    if has_advanced_stock:
+        extra_cols = [
+            c for c in ["Stock minimum projeté", "Première date à risque", "Stock sécurité", "Délai (jours)",
+                        "Date limite de commande", "Jours avant date limite"]
+            if c in item_totals_display.columns
+        ]
+        insert_at = priority_cols.index("Stock projeté (fin de période)") + 1
+        priority_cols[insert_at:insert_at] = extra_cols
+        priority_fmt.update({
+            "Stock minimum projeté": "{:.0f}", "Première date à risque": "{:%d/%m/%Y}", "Stock sécurité": "{:.0f}",
+            "Délai (jours)": "{:.0f}", "Date limite de commande": "{:%d/%m/%Y}", "Jours avant date limite": "{:.0f}",
+        })
     if has_prix_vente:
         priority_cols[3:3] = ["CA réel total", "Écart CA absolu total"]
         priority_fmt.update({"CA réel total": "{:.0f}", "Écart CA absolu total": "{:.0f}"})

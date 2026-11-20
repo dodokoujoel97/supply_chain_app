@@ -105,6 +105,37 @@ class CheckConsistencyTests(unittest.TestCase):
         text = messages(dq.check_consistency(self.orders, self.forecast, None, prices))
         self.assertIn("fichier de prix", text)
 
+    def test_receipt_item_missing_from_stock(self):
+        stock = frame([("A", 5)], cols=("Item", "Stock"))
+        receipts = frame([("2026-08-08", "B", 10)])  # B a de la demande mais pas de stock initial
+        text = messages(dq.check_consistency(self.orders, self.forecast, stock, receipts=receipts))
+        self.assertIn("les réceptions mais absents du fichier de stock (B)", text)
+        self.assertIn("Leur stock initial est compté à 0", text)
+
+    def test_receipt_for_item_without_demand_gives_a_single_message(self):
+        stock = frame([("A", 5), ("B", 5)], cols=("Item", "Stock"))
+        receipts = frame([("2026-08-08", "Z", 10)])
+        issues = dq.check_consistency(self.orders, self.forecast, stock, receipts=receipts)
+        self.assertEqual([i["level"] for i in issues], [dq.INFO])
+
+    def test_receipts_for_unknown_item_are_ignored_with_info(self):
+        receipts = frame([("2026-08-08", "Z", 10)])
+        issues = dq.check_consistency(self.orders, self.forecast, receipts=receipts)
+        self.assertEqual([i["level"] for i in issues], [dq.INFO])
+        self.assertIn("ignorées", issues[0]["message"])
+
+    def test_params_for_unknown_item_are_ignored_with_info(self):
+        params = pd.DataFrame({"Item": ["A", "Z"], "Délai (jours)": [3, 5]})
+        issues = dq.check_consistency(self.orders, self.forecast, params=params)
+        self.assertEqual([i["level"] for i in issues], [dq.INFO])
+        self.assertIn("Z", issues[0]["message"])
+
+    def test_known_receipts_and_params_have_no_issue(self):
+        receipts = frame([("2026-08-08", "A", 10)])
+        params = pd.DataFrame({"Item": ["A", "B"], "Délai (jours)": [3, 5]})
+        stock = frame([("A", 5), ("B", 5)], cols=("Item", "Stock"))
+        self.assertEqual(dq.check_consistency(self.orders, self.forecast, stock, None, receipts, params), [])
+
     def test_none_inputs_are_safe(self):
         self.assertEqual(dq.check_consistency(None, None), [])
 

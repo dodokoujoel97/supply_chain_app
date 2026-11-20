@@ -158,8 +158,8 @@ def _compare(issues, level, name_a, items_a, name_b, items_b, consequence):
     issues.append(issue(level, message))
 
 
-def check_consistency(orders, forecast, stock=None, prices=None):
-    """Contrôles croisés entre commandes, prévisionnel, stock et prix."""
+def check_consistency(orders, forecast, stock=None, prices=None, receipts=None, params=None):
+    """Contrôles croisés entre commandes, prévisionnel, stock, prix, réceptions et paramètres."""
     issues = []
     if orders is None or forecast is None or orders.empty or forecast.empty:
         return issues
@@ -179,6 +179,19 @@ def check_consistency(orders, forecast, stock=None, prices=None):
     if prices is not None and not prices.empty:
         _compare(issues, WARNING, "les commandes", order_items, "du fichier de prix", set(prices["Item"]),
                  "Leur chiffre d'affaires et leur valeur de stock sont sous-estimés.")
+
+    demand_items = order_items | forecast_items
+    if receipts is not None and not receipts.empty:
+        receipt_items = set(receipts["Item"])
+        if stock is not None and not stock.empty:
+            # Seuls les articles qui ont une demande comptent : les autres sont signalés plus bas comme ignorés.
+            _compare(issues, WARNING, "les réceptions", receipt_items & demand_items, "du fichier de stock",
+                     set(stock["Item"]), "Leur stock initial est compté à 0.")
+        _compare(issues, INFO, "les réceptions", receipt_items, "des commandes et du prévisionnel", demand_items,
+                 "Ces réceptions sont ignorées (aucune demande à couvrir).")
+    if params is not None and not params.empty:
+        _compare(issues, INFO, "le fichier de paramètres", set(params["Item"]), "des commandes et du prévisionnel",
+                 demand_items, "Ces paramètres sont ignorés.")
 
     order_dates, forecast_dates = orders["Date"], forecast["Date"]
     if order_dates.max() < forecast_dates.min() or forecast_dates.max() < order_dates.min():

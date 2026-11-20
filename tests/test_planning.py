@@ -180,5 +180,146 @@ class SummarizeAndRecommendTests(unittest.TestCase):
         self.assertEqual(reco.loc["B", "Besoin recommandé / période"], 7)
 
 
+class ReceiptsTests(unittest.TestCase):
+    """Réceptions attendues : le stock projeté = initial + réceptions cumulées − demande cumulée."""
+
+    def setUp(self):
+        # Demande réelle de 100 par semaine pendant 3 semaines, stock initial 150.
+        self.merged = merged_from(
+            [("2026-08-03", "A", 100), ("2026-08-10", "A", 100), ("2026-08-17", "A", 100)],
+            [("2026-08-03", "A", 100), ("2026-08-10", "A", 100), ("2026-08-17", "A", 100)],
+        )
+
+    def project(self, receipts):
+        return planning.project_stock(self.merged, stock([("A", 150)]), frame(receipts) if receipts else None, freq="W-MON")
+
+    def test_without_receipts_nothing_changes(self):
+        out = self.project(None)
+        self.assertNotIn("Réceptions cumulées", out.columns)
+        self.assertEqual(out["Stock projeté"].tolist(), [50, -50, -150])
+
+    def test_receipt_cancels_a_shortage(self):
+        out = self.project([("2026-08-10", "A", 200)])  # reçue la semaine 2
+        self.assertEqual(out["Réceptions cumulées"].tolist(), [0, 200, 200])
+        self.assertEqual(out["Stock projeté"].tolist(), [50, 150, 50])
+        self.assertTrue((out["Statut couverture"] == planning.STATUS_COVERED).all())
+
+    def test_receipt_before_first_period_counts_from_the_start(self):
+        out = self.project([("2026-07-01", "A", 60)])
+        self.assertEqual(out["Réceptions cumulées"].tolist(), [60, 60, 60])
+
+    def test_receipt_in_a_period_without_demand_is_kept_for_later_periods(self):
+        merged = merged_from([("2026-08-03", "A", 100), ("2026-08-24", "A", 100)],
+                             [("2026-08-03", "A", 100), ("2026-08-24", "A", 100)])
+        out = planning.project_stock(merged, stock([("A", 0)]), frame([("2026-08-12", "A", 250)]), freq="W-MON")
+        self.assertEqual(out["Réceptions cumulées"].tolist(), [0, 250])
+        self.assertEqual(out["Stock projeté"].tolist(), [-100, 50])
+
+    def test_receipts_are_per_item(self):
+        merged = merged_from([("2026-08-03", "A", 10), ("2026-08-03", "B", 10)],
+                              [("2026-08-03", "A", 10), ("2026-08-03", "B", 10)])
+        out = planning.project_stock(merged, stock([("A", 0), ("B", 0)]), frame([("2026-08-03", "B", 50)]), freq="W-MON")
+        by_item = out.set_index("Item")["Stock projeté"]
+        self.assertEqual(by_item["A"], -10)
+        self.assertEqual(by_item["B"], 40)
+
+    def test_receipts_ignored_without_stock_file(self):
+        out = planning.project_stock(self.merged, None, frame([("2026-08-10", "A", 200)]), freq="W-MON")
+        self.assertTrue((out["Statut couverture"] == planning.STATUS_NO_STOCK).all())
+
+    def test_summary_keeps_the_worst_status_over_the_horizon(self):
+        # Rupture en semaine 2 (−50), rattrapée en semaine 3 par une grosse réception :
+        # la dernière période est « Couvert », mais l'article a bien eu une rupture.
+        out = self.project([("2026-08-17", "A", 500)])
+        self.assertEqual(out["Statut couverture"].tolist(),
+                         [planning.STATUS_COVERED, planning.STATUS_SHORTAGE, planning.STATUS_COVERED])
+        totals = planning.summarize_items(out, True, False, False).iloc[0]
+        self.assertEqual(totals["Statut couverture"], planning.STATUS_SHORTAGE)
+        self.assertEqual(totals["Priorité"], planning.URGENT)
+        self.assertEqual(totals["Stock minimum projeté"], -50)
+        self.assertEqual(totals["Stock projeté"], 350)  # fin de période, lui, est positif
+        self.assertEqual(totals["Première date à risque"], pd.Timestamp("2026-08-10"))
+
+
+class SafetyStockAndLeadTimeTests(unittest.TestCase):
+    def setUp(self):
+        self.merged = merged_from(
+            [("2026-08-03", "A", 100), ("2026-08-10", "A", 100), ("2026-08-17", "A", 100)],
+            [("2026-08-03", "A", 100), ("2026-08-10", "A", 100), ("2026-08-17", "A", 100)],
+        )
+        self.stock = stock([("A", 250)])  # stock projeté : 150, 50, -50
+
+    def params(self, lead=None, safety=None):
+        data = {"Item": ["A"]}
+        if lead is not None:
+            data[planning.LEAD_TIME] = [lead]
+        if safety is not None:
+            data[planning.SAFETY_STOCK] = [safety]
+        return pd.DataFrame(data)
+
+    def test_without_safety_stock_threshold_is_zero(self):
+        out = planning.project_stock(self.merged, self.stock)
+        self.assertEqual(out["Statut couverture"].tolist(),
+                         [planning.STATUS_COVERED, planning.STATUS_COVERED, planning.STATUS_SHORTAGE])
+        self.assertNotIn(planning.SAFETY_STOCK, out.columns)
+
+    def test_below_safety_stock_status_and_need(self):
+        out = planning.project_stock(self.merged, self.stock, params_df=self.params(safety=80))
+        self.assertEqual(out["Statut couverture"].tolist(),
+                         [planning.STATUS_COVERED, planning.STATUS_BELOW_SAFETY, planning.STATUS_SHORTAGE])
+        # besoin = quantité pour revenir au stock de sécurité
+        self.assertEqual(out["Besoin net"].tolist(), [0, 30, 130])
+
+    def test_stock_equal_to_safety_stock_is_covered(self):
+        out = planning.project_stock(self.merged, self.stock, params_df=self.params(safety=50))
+        self.assertEqual(out["Statut couverture"].iloc[1], planning.STATUS_COVERED)
+
+    def test_below_safety_stock_is_high_priority_with_replenish_action(self):
+        out = planning.project_stock(self.merged, stock([("A", 400)]), params_df=self.params(safety=80))
+        # stock projeté : 300, 200, 100 -> jamais sous 80 : couvert
+        self.assertEqual(planning.summarize_items(out, True, False, False).iloc[0]["Statut couverture"],
+                         planning.STATUS_COVERED)
+        out = planning.project_stock(self.merged, stock([("A", 330)]), params_df=self.params(safety=80))
+        # stock projeté : 230, 130, 30 -> sous 80 en dernière période, sans rupture
+        row = planning.summarize_items(out, True, False, False).iloc[0]
+        self.assertEqual(row["Statut couverture"], planning.STATUS_BELOW_SAFETY)
+        self.assertEqual(row["Priorité"], planning.HIGH)
+        self.assertEqual(row["Action recommandée"], planning.ACTION_REPLENISH)
+        self.assertIn("stock de sécurité", row["Justification"])
+
+    def test_order_deadline_is_first_risk_date_minus_lead_time(self):
+        out = planning.project_stock(self.merged, self.stock)
+        row = planning.summarize_items(out, True, False, False, self.params(lead=7)).iloc[0]
+        self.assertEqual(row["Première date à risque"], pd.Timestamp("2026-08-17"))
+        self.assertEqual(row["Date limite de commande"], pd.Timestamp("2026-08-10"))
+
+    def test_deadline_days_left_and_late_order_wording(self):
+        out = planning.project_stock(self.merged, self.stock)
+        late = planning.summarize_items(out, True, False, False, self.params(lead=7), pd.Timestamp("2026-08-15")).iloc[0]
+        self.assertEqual(late["Jours avant date limite"], -5)
+        self.assertIn("Délai dépassé de 5 j", late["Justification"])
+        self.assertIn("10/08/2026", late["Justification"])
+        in_time = planning.summarize_items(out, True, False, False, self.params(lead=7), pd.Timestamp("2026-08-01")).iloc[0]
+        self.assertEqual(in_time["Jours avant date limite"], 9)
+        self.assertNotIn("dépassé", in_time["Justification"])
+
+    def test_article_without_risk_has_no_deadline(self):
+        out = planning.project_stock(self.merged, stock([("A", 5000)]))
+        row = planning.summarize_items(out, True, False, False, self.params(lead=7)).iloc[0]
+        self.assertTrue(pd.isna(row["Première date à risque"]))
+        self.assertTrue(pd.isna(row["Date limite de commande"]))
+
+    def test_article_missing_from_params_has_no_deadline(self):
+        out = planning.project_stock(self.merged, self.stock)
+        other = pd.DataFrame({"Item": ["Z"], planning.LEAD_TIME: [3]})
+        row = planning.summarize_items(out, True, False, False, other).iloc[0]
+        self.assertTrue(pd.isna(row["Date limite de commande"]))
+
+    def test_params_without_lead_time_column(self):
+        out = planning.project_stock(self.merged, self.stock, params_df=self.params(safety=10))
+        row = planning.summarize_items(out, True, False, False, self.params(safety=10)).iloc[0]
+        self.assertNotIn("Date limite de commande", row.index)
+
+
 if __name__ == "__main__":
     unittest.main()

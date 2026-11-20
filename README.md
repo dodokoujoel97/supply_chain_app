@@ -80,6 +80,24 @@ Date,Item,Quantité
 
 Le fichier de stock utilise `Item` et `Stock`. Le fichier facultatif des prix utilise `Item` avec `Prix vente`, `Prix achat`, ou les deux. Les formats CSV et Excel sont acceptés.
 
+### Réceptions, délais et stock de sécurité (facultatifs, nécessitent le fichier de stock)
+
+```csv
+Date,Item,Quantité            # réceptions attendues (commandes fournisseurs, OF lancés)
+2026-08-17,Produit A,150
+```
+
+```csv
+Item,Délai (jours),Stock sécurité
+Produit A,7,80
+```
+
+- Les réceptions sont ajoutées au stock projeté à partir de leur période : `stock projeté = stock initial + réceptions cumulées − demande réelle cumulée`.
+- Sous le **stock de sécurité**, l'article passe « Sous stock de sécurité » (priorité Élevée, action « Lancer OF / réapprovisionner ») avant d'atteindre la rupture. Le besoin net est la quantité nécessaire pour revenir au stock de sécurité.
+- Le **statut d'un article** est le pire statut rencontré sur tout l'horizon, même si une réception rétablit le stock plus tard.
+- La **date limite de commande** est la première date à risque moins le délai d'approvisionnement. Elle est comparée à la « Date de référence » de la barre latérale (aujourd'hui par défaut) pour signaler un délai déjà dépassé.
+- Les stocks sont évalués en fin de période : une rupture ou une réception à l'intérieur d'une même période n'est pas distinguée.
+
 ## Utilisation
 
 1. Téléverse le carnet de commandes réelles.
