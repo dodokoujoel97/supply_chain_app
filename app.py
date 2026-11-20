@@ -6,6 +6,8 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
+import data_quality as dq
+
 # ---------------------------------------------------------------------------
 # Garde-fou "bare mode" : si le script est lancé avec `python app.py` au lieu de
 # `streamlit run app.py`, Streamlit tourne à vide, st.stop() n'a aucun effet, et
@@ -266,9 +268,12 @@ def read_tabular_file(uploaded_file):
             return pd.read_csv(uploaded_file, sep="\t", engine="python")
 
 
-def load_data(uploaded_file, require_date, dayfirst_flag):
+def load_data(uploaded_file, require_date, dayfirst_flag, issues=None):
     """Charge et nettoie un fichier. Lève ValueError avec un message clair en cas de problème
-    (au lieu de laisser remonter une exception brute jusqu'à l'interface)."""
+    (au lieu de laisser remonter une exception brute jusqu'à l'interface).
+    Les anomalies non bloquantes (lignes ignorées, valeurs vides…) sont ajoutées à `issues`."""
+    issues = issues if issues is not None else []
+    label = f"'{uploaded_file.name}'"
     df = read_tabular_file(uploaded_file)
     df.columns = [str(c).strip() for c in df.columns]
     df = normalize_columns(df)
@@ -285,16 +290,29 @@ def load_data(uploaded_file, require_date, dayfirst_flag):
         parsed = pd.to_datetime(df["Date"], dayfirst=dayfirst_flag, errors="coerce")
         if parsed.isna().all():
             raise ValueError(f"'{uploaded_file.name}' : aucune date lisible (vérifie le format JJ/MM/AAAA dans la barre latérale).")
+        n_bad_dates = int(parsed.isna().sum())
+        if n_bad_dates:
+            issues.append(dq.issue(dq.WARNING, f"{label} : {n_bad_dates} ligne(s) ignorée(s) car la date est illisible."))
         df["Date"] = parsed
         df = df.dropna(subset=["Date"])
-        df["Quantité"] = pd.to_numeric(df["Quantité"], errors="coerce").fillna(0)
+        quantities = pd.to_numeric(df["Quantité"], errors="coerce")
+        n_bad_qty = int(quantities.isna().sum())
+        if n_bad_qty:
+            issues.append(dq.issue(dq.WARNING, f"{label} : {n_bad_qty} quantité(s) vide(s) ou non numérique(s), comptée(s) comme 0."))
+        df["Quantité"] = quantities.fillna(0)
+        issues.extend(dq.check_frame(df, label, "Quantité"))
     else:
         df = infer_missing_columns(df, ["Item", "Stock"])
         df = df.loc[:, ~df.columns.duplicated()].copy()
         if "Item" not in df.columns or "Stock" not in df.columns:
             raise ValueError(f"'{uploaded_file.name}' : colonnes Item/Stock manquantes.")
         df["Item"] = df["Item"].astype(str).str.strip()
-        df["Stock"] = pd.to_numeric(df["Stock"], errors="coerce").fillna(0)
+        stocks = pd.to_numeric(df["Stock"], errors="coerce")
+        n_bad_stock = int(stocks.isna().sum())
+        if n_bad_stock:
+            issues.append(dq.issue(dq.WARNING, f"{label} : {n_bad_stock} stock(s) vide(s) ou non numérique(s), compté(s) comme 0."))
+        df["Stock"] = stocks.fillna(0)
+        issues.extend(dq.check_frame(df, label, "Stock"))
 
     return df
 
@@ -321,7 +339,7 @@ def load_price_data(uploaded_file):
     return df
 
 
-def safe_load_many(files, require_date, dayfirst_flag):
+def safe_load_many(files, require_date, dayfirst_flag, issues=None):
     """Charge une liste de fichiers en ignorant ceux en erreur (avec message), plutôt que
     de faire planter toute l'application à cause d'un seul fichier mal formé."""
     frames, errors = [], []
@@ -329,7 +347,7 @@ def safe_load_many(files, require_date, dayfirst_flag):
         if f is None:
             continue
         try:
-            frames.append(load_data(f, require_date, dayfirst_flag))
+            frames.append(load_data(f, require_date, dayfirst_flag, issues))
         except ValueError as e:
             errors.append(str(e))
     for e in errors:
@@ -368,15 +386,17 @@ def safe_load_prices(files):
 single_ready = orders_file is not None and forecast_file is not None
 multi_ready = bool(multi_orders_files) and bool(multi_forecast_files)
 
+quality_issues = []
+
 if single_ready:
-    orders_df = safe_load_many([orders_file], True, dayfirst)
-    forecast_df = safe_load_many([forecast_file], True, dayfirst)
-    stock_df = safe_load_many([stock_file] if stock_file is not None else [], False, dayfirst)
+    orders_df = safe_load_many([orders_file], True, dayfirst, quality_issues)
+    forecast_df = safe_load_many([forecast_file], True, dayfirst, quality_issues)
+    stock_df = safe_load_many([stock_file] if stock_file is not None else [], False, dayfirst, quality_issues)
     price_df = safe_load_prices([price_file] if price_file is not None else [])
 elif multi_ready:
-    orders_df = safe_load_many(multi_orders_files, True, dayfirst)
-    forecast_df = safe_load_many(multi_forecast_files, True, dayfirst)
-    stock_df = safe_load_many(multi_stock_files, False, dayfirst)
+    orders_df = safe_load_many(multi_orders_files, True, dayfirst, quality_issues)
+    forecast_df = safe_load_many(multi_forecast_files, True, dayfirst, quality_issues)
+    stock_df = safe_load_many(multi_stock_files, False, dayfirst, quality_issues)
     price_df = safe_load_prices(multi_price_files)
 else:
     orders_df, forecast_df, stock_df, price_df = None, None, None, None
@@ -390,6 +410,8 @@ if orders_df is None or forecast_df is None:
     # Filet de sécurité : st.stop() lève normalement une exception qui arrête l'exécution,
     # mais on protège explicitement la suite au cas où (ex. environnement non standard).
     raise SystemExit
+
+quality_issues.extend(dq.check_consistency(orders_df, forecast_df, stock_df, price_df))
 
 # ---------------------------------------------------------------------------
 # Calculs communs (faits une seule fois, utilisés par les onglets Analyse et Graphiques)
@@ -543,6 +565,16 @@ item_reco["Besoin recommandé / période"] = np.where(
 # ONGLET ANALYSE — tout le contenu est maintenant bien à l'intérieur du tab
 # ---------------------------------------------------------------------------
 with analysis_tab:
+    n_errors, n_warnings = dq.summarize(quality_issues)
+    with st.expander(
+        f"🔍 Contrôle qualité des données — {n_errors} erreur(s), {n_warnings} alerte(s)",
+        expanded=bool(n_errors or n_warnings),
+    ):
+        if not quality_issues:
+            st.success("Aucun problème détecté dans les fichiers chargés.")
+        for item in quality_issues:
+            {"error": st.error, "warning": st.warning}.get(item["level"], st.info)(item["message"])
+
     st.header("Aperçu des données")
     col1, col2 = st.columns(2)
     with col1:
