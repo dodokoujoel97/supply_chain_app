@@ -14,6 +14,22 @@ INFO = "info"
 _EMPTY_ITEMS = {"", "nan", "none", "null"}
 
 
+def parse_dates(series, dayfirst=True):
+    """Convertit une colonne en dates sans confondre jour et mois.
+
+    `pd.to_datetime(..., dayfirst=True)` lit à tort « 2026-08-01 » comme le 8 janvier et
+    rejette « 2026-08-15 ». Les dates ISO (AAAA-MM-JJ) sont donc toujours lues comme telles ;
+    `dayfirst` ne s'applique qu'aux autres formats (ex. 15/08/2026).
+    """
+    if pd.api.types.is_datetime64_any_dtype(series):
+        return series
+    text = series.astype(str).str.strip()
+    is_iso = text.str.match(r"^\d{4}-\d{1,2}-\d{1,2}")
+    iso_part = pd.to_datetime(text.where(is_iso), errors="coerce", format="mixed", dayfirst=False)
+    other_part = pd.to_datetime(text.where(~is_iso), errors="coerce", format="mixed", dayfirst=dayfirst)
+    return iso_part.fillna(other_part)
+
+
 def issue(level, message):
     return {"level": level, "message": message}
 

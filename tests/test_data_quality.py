@@ -20,6 +20,29 @@ def messages(issues):
     return " | ".join(i["message"] for i in issues)
 
 
+class ParseDatesTests(unittest.TestCase):
+    def test_iso_dates_are_not_swapped_when_dayfirst(self):
+        parsed = dq.parse_dates(pd.Series(["2026-08-01", "2026-08-15"]), dayfirst=True)
+        self.assertEqual(parsed.tolist(), [pd.Timestamp("2026-08-01"), pd.Timestamp("2026-08-15")])
+
+    def test_french_format_with_dayfirst(self):
+        parsed = dq.parse_dates(pd.Series(["01/08/2026", "15/08/2026"]), dayfirst=True)
+        self.assertEqual(parsed.tolist(), [pd.Timestamp("2026-08-01"), pd.Timestamp("2026-08-15")])
+
+    def test_us_format_without_dayfirst(self):
+        parsed = dq.parse_dates(pd.Series(["08/01/2026"]), dayfirst=False)
+        self.assertEqual(parsed.tolist(), [pd.Timestamp("2026-08-01")])
+
+    def test_mixed_formats_and_invalid_values(self):
+        parsed = dq.parse_dates(pd.Series(["2026-08-01", "15/08/2026", "n/a", None]), dayfirst=True)
+        self.assertEqual(parsed.iloc[:2].tolist(), [pd.Timestamp("2026-08-01"), pd.Timestamp("2026-08-15")])
+        self.assertTrue(parsed.iloc[2:].isna().all())
+
+    def test_existing_datetime_column_is_kept(self):
+        series = pd.Series(pd.to_datetime(["2026-08-01"]))
+        self.assertEqual(dq.parse_dates(series, True).tolist(), series.tolist())
+
+
 class CheckFrameTests(unittest.TestCase):
     def test_clean_frame_has_no_issue(self):
         df = frame([("2026-08-01", "A", 10), ("2026-08-08", "A", 12)])

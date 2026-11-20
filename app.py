@@ -287,7 +287,7 @@ def load_data(uploaded_file, require_date, dayfirst_flag, issues=None):
         if missing:
             raise ValueError(f"'{uploaded_file.name}' : colonnes manquantes ({', '.join(missing)}).")
         df["Item"] = df["Item"].astype(str).str.strip()
-        parsed = pd.to_datetime(df["Date"], dayfirst=dayfirst_flag, errors="coerce")
+        parsed = dq.parse_dates(df["Date"], dayfirst_flag)
         if parsed.isna().all():
             raise ValueError(f"'{uploaded_file.name}' : aucune date lisible (vérifie le format JJ/MM/AAAA dans la barre latérale).")
         n_bad_dates = int(parsed.isna().sum())
