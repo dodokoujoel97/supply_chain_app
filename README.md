@@ -16,7 +16,12 @@ Dans VS Code, ouvre le dossier complet avec **Fichier > Ouvrir le dossier**. L'i
 
 ## Fichiers importants
 
-- `app.py` : code de l'application.
+- `app.py` : interface Streamlit (chargement des fichiers, affichage des onglets).
+- `data_quality.py` : lecture des dates et contrôles de qualité des données.
+- `comparison.py` : rapprochement commandes / prévisionnel, gestion des données absentes.
+- `metrics.py` : indicateurs d'erreur (WAPE, biais en volume).
+- `planning.py` : stock projeté, valorisation, priorités, actions et besoin recommandé.
+- `tests/` : tests unitaires des modules de calcul (ils ne dépendent pas de Streamlit).
 - `requirements.txt` : bibliothèques Python nécessaires.
 - `sample_data_orders.csv`, `sample_data_forecast.csv`, `sample_data_stock.csv` : fichiers d'exemple.
 - `.vscode/backup.ps1` : crée une archive de sauvegarde horodatée à côté du dossier projet.
@@ -44,6 +49,14 @@ Pour lancer l'application :
 ```
 
 L'adresse locale affichée sera généralement `http://localhost:8501`. Pour ajouter une bibliothèque, ajoute-la aussi à `requirements.txt`.
+
+## Tests
+
+```bash
+.venv/bin/python -m unittest discover -s tests
+```
+
+Toute modification de la logique de calcul (`comparison.py`, `metrics.py`, `planning.py`, `data_quality.py`) doit passer ces tests. Ajoute un test pour chaque nouvelle règle.
 
 ## Sauvegarde
 
