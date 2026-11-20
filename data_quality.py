@@ -81,6 +81,65 @@ def check_frame(df, label, qty_col="Quantité"):
     return issues
 
 
+def check_multi_source(df, role, qty_col, source_col="_source"):
+    """Contrôles sur des fichiers concaténés : même contenu importé deux fois, chevauchements.
+
+    `df` doit contenir une colonne `source_col` avec le nom du fichier d'origine de chaque ligne.
+    """
+    issues = []
+    if df is None or df.empty or source_col not in df.columns or df[source_col].nunique() < 2:
+        return issues
+
+    key = [c for c in ("Date", "Item") if c in df.columns]
+    cols = key + [qty_col]
+
+    signatures = {}
+    for source, part in df.groupby(source_col):
+        ordered = part[cols].sort_values(cols).reset_index(drop=True)
+        signature = (len(ordered), int(pd.util.hash_pandas_object(ordered, index=False).sum()))
+        signatures.setdefault(signature, []).append(str(source))
+    identical_groups = [set(names) for names in signatures.values() if len(names) > 1]
+    for names in identical_groups:
+        issues.append(issue(
+            WARNING,
+            f"{role} : les fichiers {', '.join(sorted(names))} ont un contenu identique. "
+            "Doublon d'import probable : les valeurs sont comptées plusieurs fois.",
+        ))
+
+    sources_per_key = df.groupby(key)[source_col].agg(lambda s: frozenset(map(str, s)))
+    overlapping = sources_per_key[sources_per_key.map(len) > 1]
+    overlapping = overlapping[~overlapping.map(lambda s: any(s <= g for g in identical_groups))]
+    if len(overlapping):
+        files = sorted(set().union(*overlapping.tolist()))
+        what = "date/article" if "Date" in key else "article"
+        issues.append(issue(
+            WARNING,
+            f"{role} : {len(overlapping)} combinaison(s) {what} présentes dans plusieurs fichiers "
+            f"({_examples(files)}). Les valeurs sont additionnées : vérifie qu'il ne s'agit pas "
+            "du même lot importé deux fois.",
+        ))
+    return issues
+
+
+def check_price_conflicts(df):
+    """Articles dont le prix diffère selon les lignes ou les fichiers (la moyenne sera utilisée)."""
+    issues = []
+    if df is None or df.empty:
+        return issues
+    for col in ("Prix vente", "Prix achat"):
+        if col not in df.columns:
+            continue
+        distinct = df.groupby("Item")[col].nunique(dropna=True)
+        conflicts = distinct[distinct > 1].index
+        if len(conflicts):
+            issues.append(issue(
+                WARNING,
+                f"Prix : {len(conflicts)} article(s) ont un « {col} » différent selon les lignes ou les "
+                f"fichiers ({_examples(conflicts)}). C'est la moyenne qui est utilisée.",
+            ))
+    return issues
+
+
 def _unmatched(source_items, other_items):
     """Articles de `source_items` absents de `other_items`, avec un indice si seule la casse diffère."""
     missing = set(source_items) - set(other_items)

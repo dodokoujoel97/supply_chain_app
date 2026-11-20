@@ -343,25 +343,32 @@ def load_price_data(uploaded_file):
     return df
 
 
-def safe_load_many(files, require_date, dayfirst_flag, issues=None):
+def safe_load_many(files, require_date, dayfirst_flag, issues=None, role="Fichiers"):
     """Charge une liste de fichiers en ignorant ceux en erreur (avec message), plutôt que
-    de faire planter toute l'application à cause d'un seul fichier mal formé."""
+    de faire planter toute l'application à cause d'un seul fichier mal formé.
+    Avec plusieurs fichiers, signale les doublons d'import et les chevauchements dans `issues`."""
+    issues = issues if issues is not None else []
     frames, errors = [], []
     for f in files:
         if f is None:
             continue
         try:
-            frames.append(load_data(f, require_date, dayfirst_flag, issues))
+            frame = load_data(f, require_date, dayfirst_flag, issues)
+            frame["_source"] = f.name
+            frames.append(frame)
         except ValueError as e:
             errors.append(str(e))
     for e in errors:
         st.error(e)
     if not frames:
         return None
-    return pd.concat(frames, ignore_index=True) if len(frames) > 1 else frames[0]
+    combined = pd.concat(frames, ignore_index=True) if len(frames) > 1 else frames[0]
+    issues.extend(dq.check_multi_source(combined, role, "Quantité" if require_date else "Stock"))
+    return combined.drop(columns="_source")
 
 
-def safe_load_prices(files):
+def safe_load_prices(files, issues=None):
+    issues = issues if issues is not None else []
     frames, errors = [], []
     for f in files:
         if f is None:
@@ -375,6 +382,7 @@ def safe_load_prices(files):
     if not frames:
         return None
     combined = pd.concat(frames, ignore_index=True) if len(frames) > 1 else frames[0]
+    issues.extend(dq.check_price_conflicts(combined))
     # Un article peut apparaître plusieurs fois (plusieurs fichiers) : on garde la moyenne.
     agg = {}
     if "Prix vente" in combined.columns:
@@ -393,15 +401,15 @@ multi_ready = bool(multi_orders_files) and bool(multi_forecast_files)
 quality_issues = []
 
 if single_ready:
-    orders_df = safe_load_many([orders_file], True, dayfirst, quality_issues)
-    forecast_df = safe_load_many([forecast_file], True, dayfirst, quality_issues)
-    stock_df = safe_load_many([stock_file] if stock_file is not None else [], False, dayfirst, quality_issues)
-    price_df = safe_load_prices([price_file] if price_file is not None else [])
+    orders_df = safe_load_many([orders_file], True, dayfirst, quality_issues, "Commandes")
+    forecast_df = safe_load_many([forecast_file], True, dayfirst, quality_issues, "Prévisionnel")
+    stock_df = safe_load_many([stock_file] if stock_file is not None else [], False, dayfirst, quality_issues, "Stock")
+    price_df = safe_load_prices([price_file] if price_file is not None else [], quality_issues)
 elif multi_ready:
-    orders_df = safe_load_many(multi_orders_files, True, dayfirst, quality_issues)
-    forecast_df = safe_load_many(multi_forecast_files, True, dayfirst, quality_issues)
-    stock_df = safe_load_many(multi_stock_files, False, dayfirst, quality_issues)
-    price_df = safe_load_prices(multi_price_files)
+    orders_df = safe_load_many(multi_orders_files, True, dayfirst, quality_issues, "Commandes")
+    forecast_df = safe_load_many(multi_forecast_files, True, dayfirst, quality_issues, "Prévisionnel")
+    stock_df = safe_load_many(multi_stock_files, False, dayfirst, quality_issues, "Stock")
+    price_df = safe_load_prices(multi_price_files, quality_issues)
 else:
     orders_df, forecast_df, stock_df, price_df = None, None, None, None
 

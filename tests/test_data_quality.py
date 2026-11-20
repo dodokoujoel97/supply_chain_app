@@ -109,5 +109,55 @@ class CheckConsistencyTests(unittest.TestCase):
         self.assertEqual(dq.check_consistency(None, None), [])
 
 
+def tagged(rows, source, cols=("Date", "Item", "Quantité")):
+    df = frame(rows, cols)
+    df["_source"] = source
+    return df
+
+
+class MultiSourceTests(unittest.TestCase):
+    def test_single_source_has_no_issue(self):
+        df = tagged([("2026-08-01", "A", 10)], "a.csv")
+        self.assertEqual(dq.check_multi_source(df, "Commandes", "Quantité"), [])
+
+    def test_identical_files_are_reported_once(self):
+        rows = [("2026-08-01", "A", 10), ("2026-08-08", "A", 12)]
+        df = pd.concat([tagged(rows, "mars.csv"), tagged(rows, "mars_copie.csv")], ignore_index=True)
+        issues = dq.check_multi_source(df, "Commandes", "Quantité")
+        self.assertEqual(len(issues), 1)
+        self.assertIn("contenu identique", issues[0]["message"])
+        self.assertIn("mars_copie.csv", issues[0]["message"])
+
+    def test_overlapping_periods_are_reported(self):
+        a = tagged([("2026-08-01", "A", 10), ("2026-08-08", "A", 12)], "a.csv")
+        b = tagged([("2026-08-08", "A", 15), ("2026-08-15", "A", 9)], "b.csv")
+        issues = dq.check_multi_source(pd.concat([a, b], ignore_index=True), "Commandes", "Quantité")
+        self.assertEqual(len(issues), 1)
+        self.assertIn("1 combinaison(s) date/article", issues[0]["message"])
+
+    def test_distinct_periods_have_no_issue(self):
+        a = tagged([("2026-08-01", "A", 10)], "a.csv")
+        b = tagged([("2026-08-08", "A", 15)], "b.csv")
+        self.assertEqual(dq.check_multi_source(pd.concat([a, b], ignore_index=True), "Commandes", "Quantité"), [])
+
+    def test_stock_same_item_in_two_files(self):
+        a = tagged([("A", 10)], "s1.csv", cols=("Item", "Stock")).drop(columns=[])
+        b = tagged([("A", 7)], "s2.csv", cols=("Item", "Stock"))
+        issues = dq.check_multi_source(pd.concat([a, b], ignore_index=True), "Stock", "Stock")
+        self.assertIn("article", issues[0]["message"])
+
+
+class PriceConflictTests(unittest.TestCase):
+    def test_conflicting_prices(self):
+        df = pd.DataFrame({"Item": ["A", "A", "B"], "Prix vente": [10.0, 12.0, 5.0]})
+        issues = dq.check_price_conflicts(df)
+        self.assertEqual(len(issues), 1)
+        self.assertIn("A", issues[0]["message"])
+
+    def test_same_price_twice_is_fine(self):
+        df = pd.DataFrame({"Item": ["A", "A"], "Prix vente": [10.0, 10.0], "Prix achat": [4.0, 4.0]})
+        self.assertEqual(dq.check_price_conflicts(df), [])
+
+
 if __name__ == "__main__":
     unittest.main()
