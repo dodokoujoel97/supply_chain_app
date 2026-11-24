@@ -768,8 +768,9 @@ with charts_tab:
         with chart_tabs[0]:
             top10 = pareto_df.head(10).copy()
             top10["Item"] = top10["Item"].astype(str)
+            item_order = top10["Item"].tolist()
             bar = alt.Chart(top10).mark_bar(opacity=0.9).encode(
-                x=alt.X("Item:N", sort="-y", title="Référence"),
+                x=alt.X("Item:N", sort=item_order, title="Référence"),
                 y=alt.Y(f"{pareto_metric}:Q", title="Impact"),
                 color=alt.Color("Priorité:N", scale=alt.Scale(
                     domain=["Urgent", "Élevée", "Moyenne", "Faible"],
@@ -778,11 +779,16 @@ with charts_tab:
                 tooltip=["Item", pareto_metric, "WAPE (%)", "Biais (%)", "Priorité", "Action recommandée"],
             ).properties(title="Diagramme Pareto par référence", height=360)
             line = alt.Chart(top10).mark_line(color="#7dd3fc", point=True, strokeWidth=2.5).encode(
-                x=alt.X("Item:N", sort="-y"),
-                y=alt.Y("Cumul %:Q", title="Cumul (%)"),
+                x=alt.X("Item:N", sort=item_order),
+                y=alt.Y(
+                    "Cumul %:Q",
+                    title="Cumul (%)",
+                    scale=alt.Scale(domain=[0, 100]),
+                    axis=alt.Axis(orient="right"),
+                ),
                 tooltip=["Item", "Cumul %"],
             )
-            st.altair_chart(bar + line, use_container_width=True)
+            st.altair_chart((bar + line).resolve_scale(y="independent"), use_container_width=True)
 
         with chart_tabs[1]:
             if stock_df is not None:
